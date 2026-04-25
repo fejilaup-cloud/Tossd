@@ -342,6 +342,10 @@ pub enum StorageKey {
     Stats,
     /// Per-player game state ([`GameState`]), keyed by player address.
     PlayerGame(Address),
+    /// Per-player referrer address, keyed by player address.
+    PlayerReferrer(Address),
+    /// Per-referrer accumulated rewards, keyed by referrer address.
+    ReferrerRewards(Address),
 }
 
 /// Multiplier values in basis points (1 bps = 0.0001x).
@@ -610,6 +614,48 @@ impl CoinflipContract {
             .remove(&StorageKey::PlayerGame(player.clone()));
     }
 
+    /// Set a player's referrer address.
+    fn set_player_referrer(env: &Env, player: &Address, referrer: &Address) {
+        let key = StorageKey::PlayerReferrer(player.clone());
+        env.storage().persistent().set(&key, referrer);
+        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+    }
+
+    /// Get a player's referrer address. Returns `None` if no referrer is set.
+    fn get_player_referrer(env: &Env, player: &Address) -> Option<Address> {
+        let key = StorageKey::PlayerReferrer(player.clone());
+        if env.storage().persistent().has(&key) {
+            env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+        }
+        env.storage().persistent().get(&key)
+    }
+
+    /// Add referral rewards to a referrer's accumulated balance.
+    fn add_referrer_rewards(env: &Env, referrer: &Address, amount: i128) {
+        let key = StorageKey::ReferrerRewards(referrer.clone());
+        let current = env.storage().persistent().get::<_, i128>(&key).unwrap_or(0);
+        let new_balance = current.checked_add(amount).unwrap_or(current);
+        env.storage().persistent().set(&key, &new_balance);
+        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+    }
+
+    /// Get a referrer's accumulated rewards.
+    fn get_referrer_rewards(env: &Env, referrer: &Address) -> i128 {
+        let key = StorageKey::ReferrerRewards(referrer.clone());
+        if env.storage().persistent().has(&key) {
+            env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+        }
+        env.storage().persistent().get(&key).unwrap_or(0)
+    }
+
+    /// Claim accumulated referral rewards.
+    fn claim_referrer_rewards(env: &Env, referrer: &Address) -> i128 {
+        let key = StorageKey::ReferrerRewards(referrer.clone());
+        let rewards = env.storage().persistent().get::<_, i128>(&key).unwrap_or(0);
+        env.storage().persistent().remove(&key);
+        rewards
+    }
+
     /// Begin a new coinflip game for `player`.
     ///
     /// Acceptance invariants:
@@ -663,6 +709,7 @@ impl CoinflipContract {
         side: Side,
         wager: i128,
         commitment: BytesN<32>,
+        referrer: Option<Address>,
     ) -> Result<(), Error> {
         player.require_auth();
 
@@ -700,6 +747,11 @@ impl CoinflipContract {
             .ok_or(Error::InsufficientReserves)?;
         if stats.reserve_balance < max_payout {
             return Err(Error::InsufficientReserves);
+        }
+
+        // Track referrer if provided
+        if let Some(ref ref_addr) = referrer {
+            Self::set_player_referrer(&env, &player, ref_addr);
         }
 
         // Generate contract-side randomness contribution from ledger sequence
@@ -880,6 +932,17 @@ impl CoinflipContract {
         // Mark game completed before transfers for the same reason.
         game.phase = GamePhase::Completed;
         Self::save_player_game(&env, &player, &game);
+
+        // Distribute referral rewards (1% of protocol fees)
+        if let Some(referrer) = Self::get_player_referrer(&env, &player) {
+            let referral_reward = fee_amount
+                .checked_mul(1)
+                .and_then(|v| v.checked_div(100))
+                .unwrap_or(0);
+            if referral_reward > 0 {
+                Self::add_referrer_rewards(&env, &referrer, referral_reward);
+            }
+        }
 
         // Transfer net payout to player
         token_client.transfer(&env.current_contract_address(), &player, &net_payout);
@@ -1292,6 +1355,36 @@ impl CoinflipContract {
         Self::delete_player_game(&env, &player);
 
         Ok(game.wager)
+    }
+
+    /// Claim accumulated referral rewards.
+    ///
+    /// Allows a referrer to withdraw their accumulated rewards from referred players' wins.
+    /// Referral rewards are calculated as 1% of the protocol fees collected from referred players.
+    ///
+    /// # Arguments
+    /// - `referrer` – must authorize; must have accumulated rewards
+    ///
+    /// # Returns
+    /// `Ok(rewards_amount)` — the total accumulated rewards in stroops.
+    ///
+    /// # Errors
+    /// - `TransferFailed` – token transfer fails
+    pub fn claim_referral_rewards(
+        env: Env,
+        referrer: Address,
+    ) -> Result<i128, Error> {
+        referrer.require_auth();
+
+        let rewards = Self::claim_referrer_rewards(&env, &referrer);
+        
+        if rewards > 0 {
+            let config = Self::load_config(&env);
+            let token_client = token::Client::new(&env, &config.token);
+            token_client.transfer(&env.current_contract_address(), &referrer, &rewards);
+        }
+
+        Ok(rewards)
     }
 }
 
